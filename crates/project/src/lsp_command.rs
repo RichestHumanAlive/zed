@@ -9,6 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use client::proto::{self, PeerId};
 use clock::Global;
+use collections::HashSet;
 use futures::future;
 use gpui::{AppContext, AsyncAppContext, Model};
 use language::{
@@ -19,9 +20,9 @@ use language::{
     OffsetRangeExt, PointUtf16, ToOffset, ToPointUtf16, Transaction, Unclipped,
 };
 use lsp::{
-    CompletionContext, CompletionListItemDefaultsEditRange, CompletionTriggerKind,
-    DocumentHighlightKind, LanguageServer, LanguageServerId, LinkedEditingRangeServerCapabilities,
-    OneOf, ServerCapabilities,
+    CodeActionOptions, CompletionContext, CompletionListItemDefaultsEditRange,
+    CompletionTriggerKind, DocumentHighlightKind, LanguageServer, LanguageServerId,
+    LinkedEditingRangeServerCapabilities, OneOf, ServerCapabilities,
 };
 use signature_help::{lsp_to_proto_signature, proto_to_lsp_signature};
 use std::{cmp::Reverse, ops::Range, path::Path, sync::Arc};
@@ -1864,6 +1865,24 @@ impl LspCommand for GetCodeActions {
         match &capabilities.code_action_provider {
             None => false,
             Some(lsp::CodeActionProviderCapability::Simple(false)) => false,
+            Some(lsp::CodeActionProviderCapability::Options(CodeActionOptions {
+                code_action_kinds: Some(supported_action_kinds),
+                ..
+            })) => {
+                if let Some(requested) = self.kinds.clone() {
+                    let server_supported = supported_action_kinds
+                        .clone()
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+
+                    // If no kind that we want to request is supported, we don't send
+                    // the request. If >= 1 is supported, we send the request, but
+                    // filter out the action kinds below.
+                    requested.iter().any(|kind| server_supported.contains(kind))
+                } else {
+                    true
+                }
+            }
             _ => true,
         }
     }
@@ -1881,6 +1900,24 @@ impl LspCommand for GetCodeActions {
             .map(|entry| entry.to_lsp_diagnostic_stub())
             .collect::<Vec<_>>();
 
+        let only = if let Some(kinds) = &self.kinds {
+            let server_supported = language_server
+                .code_action_kinds()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashSet<_>>();
+
+            Some(
+                kinds
+                    .iter()
+                    .filter(|kind| server_supported.contains(kind))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            language_server.code_action_kinds()
+        };
+
         lsp::CodeActionParams {
             text_document: lsp::TextDocumentIdentifier::new(
                 lsp::Url::from_file_path(path).unwrap(),
@@ -1890,10 +1927,7 @@ impl LspCommand for GetCodeActions {
             partial_result_params: Default::default(),
             context: lsp::CodeActionContext {
                 diagnostics: relevant_diagnostics,
-                only: self
-                    .kinds
-                    .clone()
-                    .or_else(|| language_server.code_action_kinds()),
+                only,
                 ..lsp::CodeActionContext::default()
             },
         }
